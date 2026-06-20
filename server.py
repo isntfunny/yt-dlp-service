@@ -186,6 +186,9 @@ async def fetch(
         for h in ("content-type", "content-length", "content-range", "accept-ranges", "cache-control")
         if h in upstream.headers
     }
+    # Expose the final URL (after redirects) so callers can resolve relative manifest URIs
+    # against it — `upstream.url` on the caller side would be this service, not the real host.
+    passthrough["x-final-url"] = str(upstream.url)
 
     async def body_iter():
         try:
