@@ -172,8 +172,10 @@ async def fetch(
     if not (host == "youtube.com" or any(host.endswith(s) for s in FETCH_ALLOW_SUFFIXES)):
         raise HTTPException(403, f"host not allowed: {host or 'none'}")
 
+    # Ask upstream for uncompressed bytes — we stream raw (aiter_raw), so a gzip body would
+    # otherwise reach the caller still-compressed but unlabeled and break text/JSON parsing.
+    fwd_headers = {"Accept-Encoding": "identity"}
     # Forward Range so HLS / googlevideo media stays seekable (206 partial content).
-    fwd_headers = {}
     rng = request.headers.get("range") if request is not None else None
     if rng:
         fwd_headers["Range"] = rng
@@ -183,7 +185,9 @@ async def fetch(
 
     passthrough = {
         h: upstream.headers[h]
-        for h in ("content-type", "content-length", "content-range", "accept-ranges", "cache-control")
+        # content-encoding is forwarded so that if an upstream ignores our identity request and
+        # compresses anyway, the caller (which auto-decompresses) still gets correct bytes.
+        for h in ("content-type", "content-length", "content-range", "accept-ranges", "cache-control", "content-encoding")
         if h in upstream.headers
     }
     # Expose the final URL (after redirects) so callers can resolve relative manifest URIs
