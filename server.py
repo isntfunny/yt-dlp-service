@@ -12,7 +12,7 @@ Endpoints (all except /health require `Authorization: Bearer <YTDLP_SERVICE_TOKE
   POST /json     {url,args?}  -> raw `yt-dlp -j` stdout, verbatim (application/json)
   POST /get-url  {url,args?}  -> { urls: [...] }   (`yt-dlp --get-url`)
   POST /download {url,args?}  -> streams the produced media file back
-  POST /gallery  {url,cookies?} -> raw `gallery-dl -j` stdout, verbatim (application/json).
+  POST /gallery  {url,cookies?,limit?} -> raw `gallery-dl -j` stdout, verbatim (application/json).
                                  Covers what yt-dlp cannot: image posts and multi-slide
                                  carousels (Instagram et al.), which have no video format
                                  and therefore no yt-dlp result at all. `cookies` is an
@@ -72,6 +72,8 @@ FETCH_ALLOW_SUFFIXES = (
 VERSION_TIMEOUT = 15
 JSON_TIMEOUT = 90
 GALLERY_TIMEOUT = 90
+# Upper bound for /gallery's `limit`. A feed poller wants the newest handful, not an archive.
+MAX_POST_LIMIT = 50
 DOWNLOAD_TIMEOUT = 900
 
 app = FastAPI(title="yt-dlp-service", docs_url=None, redoc_url=None)
@@ -331,6 +333,8 @@ async def gallery(request: Request, authorization: str | None = Header(default=N
     arbitrary config keys, `--exec`), and no caller has needed a knob here — an allow-list
     of one (`-j`) is cheaper to keep safe than a deny-list.
 
+    Optional `limit`: cap the number of posts via --post-range, for profile/feed URLs.
+
     Optional `cookies`: a Netscape jar the caller keeps in its own store (see
     `caller_cookie_args`). It wins over a jar on our disk — the caller asked for that
     credential specifically. Without it the usual disk jar applies, so a consumer that has
@@ -340,15 +344,26 @@ async def gallery(request: Request, authorization: str | None = Header(default=N
     body = await request.json()
     url = (body.get("url") or "").strip()
     jar = body.get("cookies") or ""
+    limit = body.get("limit")
     if not url:
         raise HTTPException(400, "missing url")
     if not isinstance(jar, str):
         raise HTTPException(400, "cookies must be a string")
 
+    # `limit` maps to --post-range and exists for ONE reason: a profile URL would otherwise make
+    # gallery-dl page through the account's entire history in a single call — hundreds of
+    # requests in a burst, the fastest way to get a cookie flagged. Numeric and bounded, so this
+    # stays an allow-list of one flag rather than a caller-controlled argument.
+    range_args = []
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_POST_LIMIT:
+            raise HTTPException(400, f"limit must be an integer between 1 and {MAX_POST_LIMIT}")
+        range_args = ["--post-range", f"1-{limit}"]
+
     with contextlib.ExitStack() as stack:
         ck = (stack.enter_context(caller_cookie_args(jar)) if jar
               else stack.enter_context(cookie_args(url)))
-        p = run_gallery_dl(["-j", *ck, url], GALLERY_TIMEOUT)
+        p = run_gallery_dl(["-j", *range_args, *ck, url], GALLERY_TIMEOUT)
     if p.returncode != 0:
         return cli_error("gallery-dl", p)
     # Verbatim, like /json: the caller expects gallery-dl's exact `[[type, url, meta], …]` shape.

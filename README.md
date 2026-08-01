@@ -24,7 +24,7 @@ All except `/health` require `Authorization: Bearer $YTDLP_SERVICE_TOKEN`.
 | POST | `/json` | `{ url, args? }` | raw `yt-dlp -j` stdout, verbatim |
 | POST | `/get-url` | `{ url, args? }` | `{ urls: [...] }` (`--get-url`) |
 | POST | `/download` | `{ url, args? }` | the produced media file (streamed) |
-| POST | `/gallery` | `{ url, cookies? }` | raw `gallery-dl -j` stdout, verbatim |
+| POST | `/gallery` | `{ url, cookies?, limit? }` | raw `gallery-dl -j` stdout, verbatim |
 | GET | `/fetch` | `?url=<allow-listed>` | streams the URL from this host, forwards `Range` |
 
 `args` is an optional list of extra yt-dlp flags, e.g. `["-f","ba","--audio-format","opus"]`.
@@ -42,6 +42,11 @@ list, so `/json` fails on precisely those posts — gallery-dl enumerates every 
 **no `args`**: gallery-dl's flags reach the filesystem in more places than yt-dlp's (`-d`,
 `--config`, `-o key=value`, `--exec`), so the allow-list is just `-j` plus the cookie jar.
 It shares the cookie mechanism below — same Netscape jar, both CLIs read it.
+
+`limit` (1–50) caps the number of posts via `--post-range`. Use it for **profile URLs**: without
+it, `gallery-dl -j https://www.instagram.com/someone/` pages through the account's entire
+history in one call — hundreds of requests in a burst, the fastest way to get a cookie flagged.
+A feed poller wants the newest handful, so pass e.g. `{"limit": 5}`.
 
 ### Examples
 
