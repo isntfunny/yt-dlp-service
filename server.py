@@ -12,10 +12,12 @@ Endpoints (all except /health require `Authorization: Bearer <YTDLP_SERVICE_TOKE
   POST /json     {url,args?}  -> raw `yt-dlp -j` stdout, verbatim (application/json)
   POST /get-url  {url,args?}  -> { urls: [...] }   (`yt-dlp --get-url`)
   POST /download {url,args?}  -> streams the produced media file back
-  POST /gallery  {url}        -> raw `gallery-dl -j` stdout, verbatim (application/json).
+  POST /gallery  {url,cookies?} -> raw `gallery-dl -j` stdout, verbatim (application/json).
                                  Covers what yt-dlp cannot: image posts and multi-slide
                                  carousels (Instagram et al.), which have no video format
-                                 and therefore no yt-dlp result at all.
+                                 and therefore no yt-dlp result at all. `cookies` is an
+                                 optional Netscape jar from a caller that keeps its own
+                                 credentials; it beats the disk jar and is never persisted.
   GET  /fetch?url=...         -> streams an allow-listed URL (subtitle tracks,
                                  googlevideo/cdninstagram segments) from THIS host's IP,
                                  forwarding Range so media stays seekable.
@@ -143,6 +145,45 @@ def cookie_file_for(url: str) -> str | None:
             path = os.path.join(COOKIES_DIR, filename)
             return path if os.path.isfile(path) else None
     return None
+
+
+# A caller-supplied jar is a full Netscape cookie file. Cap it: a real jar for one site is a
+# few KB, so anything past this is a mistake or an attempt to make us write a large temp file.
+MAX_COOKIE_BYTES = 256 * 1024
+
+
+@contextlib.contextmanager
+def caller_cookie_args(jar: str):
+    """
+    Yield `--cookies <file>` for a jar the CALLER sent, written to a private temp file.
+
+    This is the inverse of `cookie_args` below and deliberately so: a consumer that keeps its
+    credentials in its own store (a database it owns) is the credential owner, and shipping the
+    jar with the request beats mirroring it onto this service's disk — nothing can go stale, and
+    a redeploy here can't lose it. The jar is never persisted; it dies with the request.
+
+    Note this does NOT loosen `sanitize_args` — `--cookies` remains rejected there, because that
+    path would let a caller point the CLI at an arbitrary path on our filesystem. Here we own
+    the path and only the file's contents come from outside.
+    """
+    if not jar:
+        yield []
+        return
+    if len(jar.encode("utf-8", errors="ignore")) > MAX_COOKIE_BYTES:
+        raise HTTPException(400, "cookies too large")
+    # Netscape jars are tab-separated; a body that has none is a wrong-format upload (JSON,
+    # spaces-instead-of-tabs) that would otherwise fail deep inside the CLI with a useless error.
+    if "\t" not in jar:
+        raise HTTPException(400, "cookies must be a Netscape-format cookie file (tab-separated)")
+
+    tmpdir = tempfile.mkdtemp(prefix="caller-cookies-")
+    try:
+        dst = os.path.join(tmpdir, "cookies.txt")
+        with open(dst, "w", encoding="utf-8") as fh:
+            fh.write(jar if jar.endswith("\n") else jar + "\n")
+        yield ["--cookies", dst]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @contextlib.contextmanager
@@ -289,13 +330,24 @@ async def gallery(request: Request, authorization: str | None = Header(default=N
     the filesystem in more places than yt-dlp's (`-d`, `--config`, `-o key=value` writing
     arbitrary config keys, `--exec`), and no caller has needed a knob here — an allow-list
     of one (`-j`) is cheaper to keep safe than a deny-list.
+
+    Optional `cookies`: a Netscape jar the caller keeps in its own store (see
+    `caller_cookie_args`). It wins over a jar on our disk — the caller asked for that
+    credential specifically. Without it the usual disk jar applies, so a consumer that has
+    none behaves exactly as before.
     """
     require_auth(authorization)
     body = await request.json()
     url = (body.get("url") or "").strip()
+    jar = body.get("cookies") or ""
     if not url:
         raise HTTPException(400, "missing url")
-    with cookie_args(url) as ck:
+    if not isinstance(jar, str):
+        raise HTTPException(400, "cookies must be a string")
+
+    with contextlib.ExitStack() as stack:
+        ck = (stack.enter_context(caller_cookie_args(jar)) if jar
+              else stack.enter_context(cookie_args(url)))
         p = run_gallery_dl(["-j", *ck, url], GALLERY_TIMEOUT)
     if p.returncode != 0:
         return cli_error("gallery-dl", p)

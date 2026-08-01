@@ -24,7 +24,7 @@ All except `/health` require `Authorization: Bearer $YTDLP_SERVICE_TOKEN`.
 | POST | `/json` | `{ url, args? }` | raw `yt-dlp -j` stdout, verbatim |
 | POST | `/get-url` | `{ url, args? }` | `{ urls: [...] }` (`--get-url`) |
 | POST | `/download` | `{ url, args? }` | the produced media file (streamed) |
-| POST | `/gallery` | `{ url }` | raw `gallery-dl -j` stdout, verbatim |
+| POST | `/gallery` | `{ url, cookies? }` | raw `gallery-dl -j` stdout, verbatim |
 | GET | `/fetch` | `?url=<allow-listed>` | streams the URL from this host, forwards `Range` |
 
 `args` is an optional list of extra yt-dlp flags, e.g. `["-f","ba","--audio-format","opus"]`.
@@ -105,6 +105,22 @@ acceptable since session IDs for these sites are long-lived (Instagram: ~1 year)
 
 Use a burner account, not a personal one — cookie-authenticated scraping risks the account
 getting rate-limited or banned.
+
+### Caller-supplied jars
+
+`/gallery` also accepts the jar **in the request** as `cookies` (Netscape text, ≤256 KB). It
+takes precedence over the disk jar and is written to a temp file that dies with the request —
+nothing is persisted here.
+
+This is for consumers that already have a durable store of their own: this service is
+stateless and gets rebuilt whenever yt-dlp or gallery-dl need a bump, and a jar in its volume
+is exactly what gets lost or forgotten in the process. A caller that keeps the jar in its own
+database can hand it over per request instead, and nothing can go stale in between. Callers
+without one are unaffected — no field, no change in behaviour.
+
+Note this does **not** loosen `sanitize_args`: `--cookies` stays rejected there, because that
+flag points the CLI at an arbitrary path on *our* filesystem. Here the service owns the path
+and only the file's contents come from outside.
 
 ## Configuration
 
