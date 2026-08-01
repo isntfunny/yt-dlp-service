@@ -1,5 +1,5 @@
 """
-yt-dlp microservice — a thin HTTP wrapper around the yt-dlp CLI.
+yt-dlp microservice — a thin HTTP wrapper around the yt-dlp (and gallery-dl) CLI.
 
 Purpose: be the single egress point for all yt-dlp / YouTube traffic. Run this on a
 host with a clean (e.g. residential) IP so requests don't hit YouTube's datacenter
@@ -12,18 +12,29 @@ Endpoints (all except /health require `Authorization: Bearer <YTDLP_SERVICE_TOKE
   POST /json     {url,args?}  -> raw `yt-dlp -j` stdout, verbatim (application/json)
   POST /get-url  {url,args?}  -> { urls: [...] }   (`yt-dlp --get-url`)
   POST /download {url,args?}  -> streams the produced media file back
+  POST /gallery  {url}        -> raw `gallery-dl -j` stdout, verbatim (application/json).
+                                 Covers what yt-dlp cannot: image posts and multi-slide
+                                 carousels (Instagram et al.), which have no video format
+                                 and therefore no yt-dlp result at all.
   GET  /fetch?url=...         -> streams an allow-listed URL (subtitle tracks,
-                                 googlevideo segments) from THIS host's IP, forwarding
-                                 Range so media stays seekable. Replaces a side proxy.
+                                 googlevideo/cdninstagram segments) from THIS host's IP,
+                                 forwarding Range so media stays seekable.
 
 `args` is an optional list of extra yt-dlp flags (e.g. ["-f","ba","--audio-format","opus"]).
-Output flags (-o/--output) are rejected — the service owns output paths.
+Flags that would let a caller redirect output, read/write local files or execute commands
+are rejected — the service owns output paths AND credentials (see sanitize_args).
+
+Cookies are a SERVER-SIDE concern: callers never send them. Drop Netscape cookie files
+into YTDLP_COOKIES_DIR (default /cookies) named after the site — e.g. instagram.txt — and
+the service injects `--cookies` itself for matching URLs. See COOKIE_HOSTS. Both CLIs read
+the same Netscape jar, so one file serves yt-dlp and gallery-dl alike.
 """
 import os
 import shutil
 import tempfile
 import mimetypes
 import subprocess
+import contextlib
 from urllib.parse import urlparse
 
 import httpx
@@ -32,20 +43,33 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from starlette.background import BackgroundTask
 
 TOKEN = os.environ.get("YTDLP_SERVICE_TOKEN", "").strip()
+COOKIES_DIR = os.environ.get("YTDLP_COOKIES_DIR", "/cookies").strip()
+
+# Host suffix -> cookie file basename inside COOKIES_DIR. A file that isn't there is simply
+# skipped, so a deploy without cookies keeps working exactly as before (anonymous).
+COOKIE_HOSTS = (
+    (".instagram.com", "instagram.txt"),
+    (".youtube.com", "youtube.txt"),
+    (".youtu.be", "youtube.txt"),
+    (".tiktok.com", "tiktok.txt"),
+)
 
 # /fetch is a deliberately narrow relay — only these hosts — so it can never become an
 # open proxy / SSRF vector. Covers YouTube pages (timedtext subtitles), media CDNs and
-# thumbnails.
+# thumbnails, plus the Instagram/Meta CDNs the Instagram extractor resolves to.
 FETCH_ALLOW_SUFFIXES = (
     ".youtube.com",
     ".googlevideo.com",
     ".ytimg.com",
     ".youtube-nocookie.com",
     ".ggpht.com",
+    ".cdninstagram.com",
+    ".fbcdn.net",
 )
 
 VERSION_TIMEOUT = 15
 JSON_TIMEOUT = 90
+GALLERY_TIMEOUT = 90
 DOWNLOAD_TIMEOUT = 900
 
 app = FastAPI(title="yt-dlp-service", docs_url=None, redoc_url=None)
@@ -66,23 +90,97 @@ def run_ytdlp(args: list[str], timeout: int) -> subprocess.CompletedProcess:
         raise HTTPException(504, "yt-dlp timed out")
 
 
+def run_gallery_dl(args: list[str], timeout: int) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["gallery-dl", *args], capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "gallery-dl timed out")
+
+
+# Flags a caller must never set. Beyond output redirection this covers anything that would
+# let the caller reach the filesystem or the service's credentials:
+#   --cookies / --cookies-from-browser  -> would override or exfiltrate our cookie jar
+#   --load-info-json / --config-location / --batch-file -> read arbitrary local files
+#   --exec / --downloader / --external-downloader -> run arbitrary commands
+#   --paths / -P / --cache-dir -> write outside the request's temp dir
+FORBIDDEN_PREFIXES = (
+    "-o", "--output",
+    "-P", "--paths",
+    "--cookies",
+    "--load-info-json", "--load-info",
+    "--config-location",
+    "-a", "--batch-file",
+    "--exec",
+    "--downloader", "--external-downloader",
+    "--cache-dir",
+)
+
+
 def sanitize_args(args) -> list[str]:
     if args is None:
         return []
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
         raise HTTPException(400, "args must be an array of strings")
-    # Output paths are owned by the service (temp dirs); callers must not set them.
+    # Output paths and credentials are owned by the service; callers must not touch either.
+    # Compare on the flag name only ("--exec=foo" and "--exec foo" are the same thing).
     for a in args:
-        if a in ("-o", "--output") or a.startswith("-o") or a.startswith("--output"):
-            raise HTTPException(400, "args must not set output (-o/--output)")
+        flag = a.split("=", 1)[0]
+        if flag in FORBIDDEN_PREFIXES:
+            raise HTTPException(400, f"args must not set {flag}")
     return args
 
 
-def ytdlp_error(p: subprocess.CompletedProcess) -> JSONResponse:
+def cookie_file_for(url: str) -> str | None:
+    """Path of the configured cookie jar for `url`, or None if there is none."""
+    if not COOKIES_DIR:
+        return None
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return None
+    for suffix, filename in COOKIE_HOSTS:
+        # ".instagram.com" must match both "instagram.com" and "www.instagram.com".
+        if host == suffix[1:] or host.endswith(suffix):
+            path = os.path.join(COOKIES_DIR, filename)
+            return path if os.path.isfile(path) else None
+    return None
+
+
+@contextlib.contextmanager
+def cookie_args(url: str):
+    """
+    Yield the `--cookies <file>` args for `url` (empty list if no jar is configured).
+
+    The jar is COPIED into a private temp dir for the duration of the run. Two reasons,
+    both load-bearing:
+      1. yt-dlp writes the cookie jar back on exit — pointed at the original it truncates
+         it to a bare header on the first request, and the credential is gone for good.
+         gallery-dl does the same (its `cookies-update` defaults to on).
+      2. Concurrent requests would race on the same file.
+    The cost is that refreshed session cookies are discarded; session IDs are long-lived,
+    so that is the cheaper side of the trade.
+    """
+    src = cookie_file_for(url)
+    if not src:
+        yield []
+        return
+    tmpdir = tempfile.mkdtemp(prefix="ytdlp-cookies-")
+    try:
+        dst = os.path.join(tmpdir, "cookies.txt")
+        shutil.copyfile(src, dst)
+        yield ["--cookies", dst]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def cli_error(tool: str, p: subprocess.CompletedProcess) -> JSONResponse:
     return JSONResponse(
-        {"error": "yt-dlp failed", "stderr": p.stderr.decode(errors="replace")[-2000:]},
+        {"error": f"{tool} failed", "stderr": p.stderr.decode(errors="replace")[-2000:]},
         status_code=502,
     )
+
+
+def ytdlp_error(p: subprocess.CompletedProcess) -> JSONResponse:
+    return cli_error("yt-dlp", p)
 
 
 @app.get("/health")
@@ -96,7 +194,20 @@ def version(authorization: str | None = Header(default=None)):
     p = run_ytdlp(["--version"], VERSION_TIMEOUT)
     if p.returncode != 0:
         raise HTTPException(502, "yt-dlp --version failed")
-    return {"version": p.stdout.decode().strip()}
+    # gallery-dl is optional in spirit: an image without it still answers, just without a version.
+    g = run_gallery_dl(["--version"], VERSION_TIMEOUT)
+    gallery_version = g.stdout.decode().strip() if g.returncode == 0 else None
+    # Which cookie jars are actually present — lets callers diagnose "login required" errors
+    # without shell access. Authenticated endpoint, so the site list stays internal.
+    cookies = sorted({
+        filename for _, filename in COOKIE_HOSTS
+        if COOKIES_DIR and os.path.isfile(os.path.join(COOKIES_DIR, filename))
+    })
+    return {
+        "version": p.stdout.decode().strip(),
+        "gallery_dl_version": gallery_version,
+        "cookies": cookies,
+    }
 
 
 @app.post("/json")
@@ -107,7 +218,8 @@ async def json_endpoint(request: Request, authorization: str | None = Header(def
     args = sanitize_args(body.get("args"))
     if not url:
         raise HTTPException(400, "missing url")
-    p = run_ytdlp(["-j", "--no-warnings", *args, url], JSON_TIMEOUT)
+    with cookie_args(url) as ck:
+        p = run_ytdlp(["-j", "--no-warnings", *ck, *args, url], JSON_TIMEOUT)
     if p.returncode != 0:
         return ytdlp_error(p)
     # Pass stdout through verbatim so the caller sees the exact `-j` shape it expects.
@@ -122,7 +234,8 @@ async def get_url(request: Request, authorization: str | None = Header(default=N
     args = sanitize_args(body.get("args"))
     if not url:
         raise HTTPException(400, "missing url")
-    p = run_ytdlp(["--get-url", "--no-warnings", *args, url], JSON_TIMEOUT)
+    with cookie_args(url) as ck:
+        p = run_ytdlp(["--get-url", "--no-warnings", *ck, *args, url], JSON_TIMEOUT)
     if p.returncode != 0:
         return ytdlp_error(p)
     urls = [ln.strip() for ln in p.stdout.decode(errors="replace").splitlines() if ln.strip().startswith("http")]
@@ -141,7 +254,8 @@ async def download(request: Request, authorization: str | None = Header(default=
     workdir = tempfile.mkdtemp(prefix="ytdlp-")
     try:
         out_tmpl = os.path.join(workdir, "media.%(ext)s")
-        p = run_ytdlp([*args, "--no-warnings", "--no-progress", "-o", out_tmpl, url], DOWNLOAD_TIMEOUT)
+        with cookie_args(url) as ck:
+            p = run_ytdlp([*ck, *args, "--no-warnings", "--no-progress", "-o", out_tmpl, url], DOWNLOAD_TIMEOUT)
         produced = [os.path.join(workdir, f) for f in os.listdir(workdir)]
         produced = [f for f in produced if os.path.isfile(f)]
         if p.returncode != 0 or not produced:
@@ -161,6 +275,34 @@ async def download(request: Request, authorization: str | None = Header(default=
         raise
 
 
+@app.post("/gallery")
+async def gallery(request: Request, authorization: str | None = Header(default=None)):
+    """
+    `gallery-dl -j <url>` — metadata for post types yt-dlp has no answer for.
+
+    yt-dlp only knows *video*: an Instagram image post or a multi-slide carousel has no
+    format list, so `/json` fails on exactly the posts a gallery view is for. gallery-dl
+    enumerates every slide (image and video) with its metadata instead, and nothing is
+    downloaded — `-j` dumps and exits.
+
+    Unlike the yt-dlp endpoints this takes NO caller args. gallery-dl's flag surface reaches
+    the filesystem in more places than yt-dlp's (`-d`, `--config`, `-o key=value` writing
+    arbitrary config keys, `--exec`), and no caller has needed a knob here — an allow-list
+    of one (`-j`) is cheaper to keep safe than a deny-list.
+    """
+    require_auth(authorization)
+    body = await request.json()
+    url = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, "missing url")
+    with cookie_args(url) as ck:
+        p = run_gallery_dl(["-j", *ck, url], GALLERY_TIMEOUT)
+    if p.returncode != 0:
+        return cli_error("gallery-dl", p)
+    # Verbatim, like /json: the caller expects gallery-dl's exact `[[type, url, meta], …]` shape.
+    return PlainTextResponse(p.stdout.decode(errors="replace"), media_type="application/json")
+
+
 @app.get("/fetch")
 async def fetch(
     url: str = Query(...),
@@ -175,6 +317,9 @@ async def fetch(
     # Ask upstream for uncompressed bytes — we stream raw (aiter_raw), so a gzip body would
     # otherwise reach the caller still-compressed but unlabeled and break text/JSON parsing.
     fwd_headers = {"Accept-Encoding": "identity"}
+    # Meta's video CDN 403s a request without a browser User-Agent (gallery-dl sends one for
+    # exactly these URLs). Harmless for the other allow-listed hosts, so it goes on every relay.
+    fwd_headers["User-Agent"] = "Mozilla/5.0"
     # Forward Range so HLS / googlevideo media stays seekable (206 partial content).
     rng = request.headers.get("range") if request is not None else None
     if rng:

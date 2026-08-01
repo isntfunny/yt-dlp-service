@@ -5,8 +5,13 @@ services:
     environment:
       # REQUIRED. Without it every protected endpoint returns 503 (fail-closed).
       YTDLP_SERVICE_TOKEN: ${YTDLP_SERVICE_TOKEN}
+      YTDLP_COOKIES_DIR: /cookies
     ports:
       - "${YTDLP_SERVICE_PORT:-8000}:8000"
+    volumes:
+      # Netscape cookie files, e.g. ./cookies/instagram.txt — see README "Cookies". Read-only:
+      # the service copies each jar into a private temp dir per request rather than writing here.
+      - ./cookies:/cookies:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
       interval: 30s

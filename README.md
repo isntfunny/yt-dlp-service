@@ -24,15 +24,24 @@ All except `/health` require `Authorization: Bearer $YTDLP_SERVICE_TOKEN`.
 | POST | `/json` | `{ url, args? }` | raw `yt-dlp -j` stdout, verbatim |
 | POST | `/get-url` | `{ url, args? }` | `{ urls: [...] }` (`--get-url`) |
 | POST | `/download` | `{ url, args? }` | the produced media file (streamed) |
+| POST | `/gallery` | `{ url }` | raw `gallery-dl -j` stdout, verbatim |
 | GET | `/fetch` | `?url=<allow-listed>` | streams the URL from this host, forwards `Range` |
 
 `args` is an optional list of extra yt-dlp flags, e.g. `["-f","ba","--audio-format","opus"]`.
 Output flags (`-o` / `--output`) are rejected — the service owns output paths.
 
 `/fetch` only relays a fixed allow-list of hosts (`*.youtube.com`, `*.googlevideo.com`,
-`*.ytimg.com`, `*.youtube-nocookie.com`, `*.ggpht.com`) so it can't become an open proxy.
-Use it for subtitle (`timedtext`) tracks and googlevideo media segments that are bound to
-the resolving host's IP.
+`*.ytimg.com`, `*.youtube-nocookie.com`, `*.ggpht.com`, `*.cdninstagram.com`, `*.fbcdn.net`)
+so it can't become an open proxy. Use it for subtitle (`timedtext`) tracks and media
+segments (googlevideo, Instagram/Meta CDN) that are bound to the resolving host's IP.
+
+`/gallery` is the one endpoint that isn't yt-dlp: it runs **gallery-dl** instead, because
+yt-dlp only knows *video*. An Instagram image post or a multi-slide carousel has no format
+list, so `/json` fails on precisely those posts — gallery-dl enumerates every slide (image
+*and* video) with metadata instead. `-j` dumps and exits; nothing is downloaded. It takes
+**no `args`**: gallery-dl's flags reach the filesystem in more places than yt-dlp's (`-d`,
+`--config`, `-o key=value`, `--exec`), so the allow-list is just `-j` plus the cookie jar.
+It shares the cookie mechanism below — same Netscape jar, both CLIs read it.
 
 ### Examples
 
@@ -57,7 +66,45 @@ curl -s -X POST $BASE/download -H "Authorization: Bearer $TOKEN" \
 
 # relay a subtitle track from this host's IP
 curl -s "$BASE/fetch?url=https://www.youtube.com/api/timedtext?..." -H "Authorization: Bearer $TOKEN"
+
+# every slide of an Instagram carousel (needs cookies/instagram.txt)
+curl -s -X POST $BASE/gallery -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://www.instagram.com/p/ABCdefGhijk/"}'
 ```
+
+## Cookies
+
+Some sites (Instagram, and increasingly YouTube for age/bot-gated videos) reject anonymous
+requests. Cookies are a **server-side-only** concern — callers never send them, and `args`
+cannot set `--cookies` (rejected by `sanitize_args`, see Security). Instead:
+
+1. Export a **Netscape-format** cookie jar for a throwaway/burner account (e.g. via a browser
+   extension like "Get cookies.txt", or `yt-dlp --cookies-from-browser <browser> --cookies out.txt
+   <any URL on that site>`).
+2. Drop it into the directory pointed to by `YTDLP_COOKIES_DIR` (default `/cookies`, mounted as
+   `./cookies` in `docker-compose.yml`), named after the site:
+
+   | File | Matches |
+   |------|---------|
+   | `instagram.txt` | `*.instagram.com` |
+   | `youtube.txt` | `*.youtube.com`, `*.youtu.be` |
+   | `tiktok.txt` | `*.tiktok.com` |
+
+3. That's it — `/json`, `/get-url`, `/download` and `/gallery` inject `--cookies <jar>` automatically for
+   any URL whose host matches. A site without a matching file behaves exactly as before
+   (anonymous). `GET /version` (authenticated) lists which jars are currently present, for
+   diagnosing "login required" errors without shell access.
+
+The jar is **copied** into a private temp dir per request, never used in place: yt-dlp
+rewrites the cookie file it's given on exit, so pointing it at the original would truncate it
+to an empty header after the very first request (gallery-dl does the same — its
+`cookies-update` is on by default). The copy also sidesteps races between
+concurrent requests. The tradeoff is that refreshed session cookies aren't persisted back —
+acceptable since session IDs for these sites are long-lived (Instagram: ~1 year).
+
+Use a burner account, not a personal one — cookie-authenticated scraping risks the account
+getting rate-limited or banned.
 
 ## Configuration
 
@@ -65,6 +112,7 @@ curl -s "$BASE/fetch?url=https://www.youtube.com/api/timedtext?..." -H "Authoriz
 |-----|----------|---------|-------|
 | `YTDLP_SERVICE_TOKEN` | **yes** | – | Bearer token. If unset, protected endpoints return `503` (fail-closed). |
 | `YTDLP_SERVICE_PORT` | no | `8000` | Host port (compose only). |
+| `YTDLP_COOKIES_DIR` | no | `/cookies` | Directory of Netscape cookie files, see Cookies. Empty/missing dir = no cookies used, no error. |
 
 ## Run
 
@@ -79,4 +127,4 @@ docker run -p 8000:8000 -e YTDLP_SERVICE_TOKEN=secret yt-dlp-service
 
 The service can download arbitrary media — **always set a token** and don't expose it
 unauthenticated. Ideally bind it to a private network (VPN/WireGuard) rather than the
-public internet. yt-dlp is pinned by the image build; rebuild to update it.
+public internet. yt-dlp and gallery-dl are pinned by the image build; rebuild to update them.
