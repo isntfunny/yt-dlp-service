@@ -12,9 +12,15 @@ services:
       # Netscape cookie files, e.g. ./cookies/instagram.txt — see README "Cookies". Read-only:
       # the service copies each jar into a private temp dir per request rather than writing here.
       - ./cookies:/cookies:ro
+      # yt-dlp caches YouTube's solved signature/nsig functions per player version. Without a
+      # volume every redeploy starts cold and re-solves them on the first extraction.
+      - ytdlp-cache:/root/.cache
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  ytdlp-cache:

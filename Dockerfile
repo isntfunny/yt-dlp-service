@@ -5,6 +5,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+# A JavaScript runtime is no longer optional for YouTube: yt-dlp solves YouTube's JS
+# challenges through EJS, and without a runtime it warns that extraction is deprecated and
+# "some formats may be missing" — which then costs extra player requests and retries.
+# Deno is the one enabled by default (>= 2.3.0), so it needs no flag. See
+# https://github.com/yt-dlp/yt-dlp/wiki/EJS
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
 COPY requirements.txt .

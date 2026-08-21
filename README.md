@@ -25,7 +25,7 @@ All except `/health` require `Authorization: Bearer $YTDLP_SERVICE_TOKEN`.
 | POST | `/get-url` | `{ url, args? }` | `{ urls: [...] }` (`--get-url`) |
 | POST | `/download` | `{ url, args? }` | the produced media file (streamed) |
 | POST | `/gallery` | `{ url, cookies?, limit? }` | raw `gallery-dl -j` stdout, verbatim |
-| GET | `/fetch` | `?url=<allow-listed>` | streams the URL from this host, forwards `Range` |
+| GET, HEAD | `/fetch` | `?url=<allow-listed>` | streams the URL from this host, forwards `Range`, always answers with `Content-Length` |
 
 `args` is an optional list of extra yt-dlp flags, e.g. `["-f","ba","--audio-format","opus"]`.
 Output flags (`-o` / `--output`) are rejected — the service owns output paths.
@@ -34,6 +34,14 @@ Output flags (`-o` / `--output`) are rejected — the service owns output paths.
 `*.ytimg.com`, `*.youtube-nocookie.com`, `*.ggpht.com`, `*.cdninstagram.com`, `*.fbcdn.net`)
 so it can't become an open proxy. Use it for subtitle (`timedtext`) tracks and media
 segments (googlevideo, Instagram/Meta CDN) that are bound to the resolving host's IP.
+
+A caller `Range` is forwarded verbatim (206 passthrough). Without one, `/fetch` asks upstream
+for `bytes=0-` anyway and turns the resulting 206 back into a 200 — so the answer always
+carries `Content-Length` and `Accept-Ranges`. That matters because Meta's video CDN answers a
+plain GET chunked, without either header, and Apple's AVFoundation refuses to play such a
+stream (it reports a generic format/codec error, while Android's ExoPlayer just streams on).
+`HEAD` probes the same way with `bytes=0-0` and returns headers only. Upstreams that ignore
+`Range` are passed through unchanged.
 
 `/gallery` is the one endpoint that isn't yt-dlp: it runs **gallery-dl** instead, because
 yt-dlp only knows *video*. An Instagram image post or a multi-slide carousel has no format
@@ -134,6 +142,31 @@ and only the file's contents come from outside.
 | `YTDLP_SERVICE_TOKEN` | **yes** | – | Bearer token. If unset, protected endpoints return `503` (fail-closed). |
 | `YTDLP_SERVICE_PORT` | no | `8000` | Host port (compose only). |
 | `YTDLP_COOKIES_DIR` | no | `/cookies` | Directory of Netscape cookie files, see Cookies. Empty/missing dir = no cookies used, no error. |
+
+## Performance
+
+Five things carry the service's speed; none of them is obvious from the endpoint list, so
+don't remove them by accident.
+
+- **Both CLIs run in a thread, never on the event loop.** `subprocess.run` blocks. Called
+  straight out of an `async def` it stops the *whole* service for the duration — up to
+  `DOWNLOAD_TIMEOUT` (15 min). Measured: a 3-second call froze the loop for 3.1 s, and what
+  freezes with it is `/fetch`, i.e. exactly the video streaming that must not stutter. Hence
+  `await run_ytdlp(...)` / `await run_gallery_dl(...)` via `asyncio.to_thread`.
+- **`/fetch` shares one pooled `httpx.AsyncClient`.** The relay is used in series (segment
+  after segment, range after range from the same host); a client per request pays DNS + TCP +
+  TLS every time. Measured against a real CDN: 157 ms per request unpooled vs 25 ms pooled.
+- **Deno is in the image.** yt-dlp needs a JS runtime for YouTube's challenges (EJS); without
+  one it warns that extraction is deprecated and formats may be missing. See the Dockerfile.
+- **`~/.cache` is a volume.** yt-dlp caches the solved signature/nsig functions per player
+  version there — without the volume every redeploy re-solves them.
+- **`/download` defaults to `-N 4`.** Fragmented (DASH/HLS) formats otherwise fetch one
+  fragment at a time. A caller's own `-N` wins.
+
+Deliberately *not* done: importing yt-dlp in-process instead of spawning the CLI. It saves
+the interpreter start (~140 ms per call, measured), but the whole safety model here is
+"the service owns the argv" (see `sanitize_args`) plus a crash-isolated child process —
+not worth trading for a tenth of a second on calls that spend seconds in the network.
 
 ## Run
 

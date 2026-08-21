@@ -1,5 +1,7 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27
-yt-dlp
+# [default] zieht die EJS-Skripte mit, die YouTube-Challenges lösen. Ohne sie lädt yt-dlp
+# sie zur Laufzeit nach (--remote-components) — ein Netz-Roundtrip pro Kaltstart.
+yt-dlp[default]
 gallery-dl
