@@ -21,7 +21,8 @@ COPY server.py .
 
 EXPOSE 8000
 
-# yt-dlp and gallery-dl are pinned by the image build — rebuild the image to bump them.
+# yt-dlp and gallery-dl are pinned in requirements.txt and bumped daily by
+# .github/workflows/bump-deps.yml; the changed file busts the pip layer cache on the next build.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"
 

@@ -1,0 +1,58 @@
+name: yt-dlp / gallery-dl aktualisieren
+
+# Hebt die Pins in requirements.txt täglich auf die neueste PyPI-Version und pusht direkt auf
+# master. Coolify deployt den Push automatisch (Auto-Deploy über die GitHub-App). Scheitert der
+# Build, lässt Coolify den alten Container laufen; Rollback = Revert des Bump-Commits.
+
+on:
+  schedule:
+    - cron: '23 4 * * *'   # täglich 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-deps
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Neueste Versionen eintragen
+        id: bump
+        run: |
+          changes="$(python scripts/bump_deps.py)"
+          echo "$changes"
+          {
+            echo 'changes<<EOF'
+            echo "$changes"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Prüft, dass die neuen Versionen sich zusammen installieren lassen — sonst bricht der
+      # Docker-Build in Coolify und der Bump bliebe liegen.
+      - name: Installation prüfen
+        if: steps.bump.outputs.changes != ''
+        run: |
+          python -m pip install --quiet -r requirements.txt
+          yt-dlp --version
+          gallery-dl --version
+
+      - name: Committen und pushen
+        if: steps.bump.outputs.changes != ''
+        env:
+          CHANGES: ${{ steps.bump.outputs.changes }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add requirements.txt
+          git commit -m "build(deps): $(echo "$CHANGES" | paste -sd ',' - | sed 's/,/, /g')" -m "$CHANGES"
+          git push

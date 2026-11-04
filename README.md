@@ -181,4 +181,13 @@ docker run -p 8000:8000 -e YTDLP_SERVICE_TOKEN=secret yt-dlp-service
 
 The service can download arbitrary media — **always set a token** and don't expose it
 unauthenticated. Ideally bind it to a private network (VPN/WireGuard) rather than the
-public internet. yt-dlp and gallery-dl are pinned by the image build; rebuild to update them.
+public internet.
+
+## Updates
+
+yt-dlp and gallery-dl are pinned exactly (`==`) in `requirements.txt`. The workflow
+[`bump-deps.yml`](.github/workflows/bump-deps.yml) runs daily (and on demand via
+*Run workflow*): [`scripts/bump_deps.py`](scripts/bump_deps.py) sets both pins to the latest
+stable PyPI release, the workflow checks that they install together, then commits
+`build(deps): yt-dlp A → B` straight to `master`. Coolify auto-deploys that push. A failed build
+leaves the old container running; roll back by reverting the bump commit.
