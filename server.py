@@ -9,7 +9,7 @@ means there is exactly one place that talks to YouTube — it cannot be bypassed
 Endpoints (all except /health require `Authorization: Bearer <YTDLP_SERVICE_TOKEN>`):
   GET  /health               -> liveness, no auth
   GET  /version              -> { version }
-  POST /json     {url,args?}  -> raw `yt-dlp -j` stdout, verbatim (application/json)
+  POST /json     {url,args?}  -> raw `yt-dlp -j` stdout (-J when requested in args)
   POST /get-url  {url,args?}  -> { urls: [...] }   (`yt-dlp --get-url`)
   POST /download {url,args?}  -> streams the produced media file back
   POST /gallery  {url,cookies?,limit?} -> raw `gallery-dl -j` stdout, verbatim (application/json).
@@ -297,11 +297,13 @@ async def json_endpoint(request: Request, authorization: str | None = Header(def
     args = sanitize_args(body.get("args"))
     if not url:
         raise HTTPException(400, "missing url")
+    # -J already dumps the whole playlist; adding -j would also print each entry.
+    dump_args = [] if any(a in ("-J", "--dump-single-json") for a in args) else ["-j"]
     with cookie_args(url) as ck:
-        p = await run_ytdlp(["-j", "--no-warnings", *ck, *args, url], JSON_TIMEOUT)
+        p = await run_ytdlp([*dump_args, "--no-warnings", *ck, *args, url], JSON_TIMEOUT)
     if p.returncode != 0:
         return ytdlp_error(p)
-    # Pass stdout through verbatim so the caller sees the exact `-j` shape it expects.
+    # Pass stdout through verbatim, including the playlist/entries shape of -J.
     return PlainTextResponse(p.stdout.decode(errors="replace"), media_type="application/json")
 
 

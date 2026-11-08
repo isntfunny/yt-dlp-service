@@ -21,13 +21,18 @@ All except `/health` require `Authorization: Bearer $YTDLP_SERVICE_TOKEN`.
 |--------|------|--------------|---------|
 | GET | `/health` | – | `{ ok, token_configured }` (no auth) |
 | GET | `/version` | – | `{ version }` |
-| POST | `/json` | `{ url, args? }` | raw `yt-dlp -j` stdout, verbatim |
+| POST | `/json` | `{ url, args? }` | raw `yt-dlp -j` stdout; `-J` instead when requested in `args` |
 | POST | `/get-url` | `{ url, args? }` | `{ urls: [...] }` (`--get-url`) |
 | POST | `/download` | `{ url, args? }` | the produced media file (streamed) |
 | POST | `/gallery` | `{ url, cookies?, limit? }` | raw `gallery-dl -j` stdout, verbatim |
 | GET, HEAD | `/fetch` | `?url=<allow-listed>` | streams the URL from this host, forwards `Range`, always answers with `Content-Length` |
 
 `args` is an optional list of extra yt-dlp flags, e.g. `["-f","ba","--audio-format","opus"]`.
+For searches and playlists, pass `-J` (or `--dump-single-json`) to receive one JSON document
+with `entries`, rather than one JSON line per video. Search prefixes such as
+`ytsearch20:Sprengung` and filtered YouTube search URLs are passed straight to yt-dlp;
+the caller owns filters, result limits, polling, and deduplication. Without `-J`, `/json`
+keeps its existing `-j` output.
 Output flags (`-o` / `--output`) are rejected — the service owns output paths.
 
 `/fetch` only relays a fixed allow-list of hosts (`*.youtube.com`, `*.googlevideo.com`,
@@ -70,6 +75,16 @@ curl -s -X POST $BASE/json -H "Authorization: Bearer $TOKEN" \
 # resolved stream URL(s)
 curl -s -X POST $BASE/get-url -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' -d '{"url":"https://www.twitch.tv/somechannel"}'
+
+# first 20 search results, metadata only, as one playlist JSON document
+curl -s -X POST $BASE/json -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"url":"ytsearch20:Sprengung","args":["--flat-playlist","-J"]}'
+
+# currently live results (the caller supplies YouTube's Live search filter)
+curl -s -X POST $BASE/json -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://www.youtube.com/results?search_query=Sprengung&sp=EgJAAQ%3D%3D","args":["--flat-playlist","--playlist-end","20","-J"]}'
 
 # download a clip as opus
 curl -s -X POST $BASE/download -H "Authorization: Bearer $TOKEN" \
